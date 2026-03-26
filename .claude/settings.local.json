@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:my.ishosting.com)",
+      "Bash(curl -s https://my.ishosting.com/openapi.yaml)"
+    ]
+  }
+}

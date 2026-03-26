@@ -1,0 +1,7 @@
+terraform-provider-ishosting
+dist/
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+.DS_Store
