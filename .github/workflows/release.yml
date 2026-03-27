@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Generate version
+        id: version
+        run: |
+          VERSION="v0.1.$(git rev-list --count HEAD)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Build binaries
+        run: |
+          declare -a TARGETS=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+          )
+
+          mkdir -p dist
+
+          for target in "${TARGETS[@]}"; do
+            OS="${target%/*}"
+            ARCH="${target#*/}"
+            NAME="terraform-provider-ishosting_${OS}_${ARCH}"
+            EXT=""
+            if [ "$OS" = "windows" ]; then EXT=".exe"; fi
+
+            echo "Building ${OS}/${ARCH}..."
+            GOOS=$OS GOARCH=$ARCH go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" \
+              -o "dist/${NAME}${EXT}"
+
+            cd dist
+            if [ "$OS" = "windows" ]; then
+              zip "${NAME}.zip" "${NAME}${EXT}"
+            else
+              tar czf "${NAME}.tar.gz" "${NAME}"
+            fi
+            rm "${NAME}${EXT}"
+            cd ..
+          done
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt

@@ -1,0 +1,10 @@
+{
+  "data": {
+    "type": "registry-providers",
+    "attributes": {
+      "name": "ishosting",
+      "namespace": "privata-solutions",
+      "registry-name": "private"
+    }
+  }
+}
