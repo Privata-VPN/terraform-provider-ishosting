@@ -111,27 +111,6 @@ jobs:
             exit 1
           fi
 
-      - name: Ensure GPG key exists in registry
-        env:
-          TF_TOKEN: ${{ secrets.TF_API_TOKEN }}
-        run: |
-          http_code=$(curl -s -o /tmp/key_resp.json -w "%{http_code}" \
-            --header "Authorization: Bearer $TF_TOKEN" \
-            --header "Content-Type: application/vnd.api+json" \
-            --request POST \
-            --data @key.json \
-            "${TF_CLOUD_API}/api/registry/private/v2/gpg-keys")
-
-          if [ "$http_code" = "201" ]; then
-            echo "GPG key uploaded successfully"
-          elif [ "$http_code" = "422" ] || [ "$http_code" = "409" ]; then
-            echo "GPG key already exists — OK"
-          else
-            echo "::error::Failed to upload GPG key (HTTP $http_code)"
-            cat /tmp/key_resp.json
-            exit 1
-          fi
-
       # ── Create version ───────────────────────────────────────────
 
       - name: Create provider version
