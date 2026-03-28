@@ -19,7 +19,7 @@ data "ishosting_vps_plans" "all" {}
 
 # Look up available configs for a specific plan
 data "ishosting_vps_configs" "plan_configs" {
-  plan_code = "vps-kvm-lin-1-ber-1m"
+  plan_code = "vps-kvm-lin-1-ber"
 }
 
 # ─── SSH Key ────────────────────────────────────────────────────
@@ -34,10 +34,10 @@ resource "ishosting_ssh_key" "my_key" {
 
 # Provision a VPS instance
 resource "ishosting_vps" "web_server" {
-  plan      = "vps-kvm-lin-1-ber-1m"
-  location  = "ber"
-  name      = "web-server-01"
-  tags      = ["web", "production"]
+  plan     = "vps-kvm-lin-1-ber-1m"
+  location = "ber"
+  name     = "web-server-01"
+  tags     = ["web", "production"]
 
   # OS selection (use ishosting_vps_configs data source to find codes)
   os_category = "os_linux_ubuntu"
