@@ -106,7 +106,7 @@ func (r *SSHKeyResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 
-	plan.ID = types.StringValue(sshKey.ID)
+	plan.ID = types.StringValue(sshKey.ID.String())
 	plan.Fingerprint = types.StringValue(sshKey.Fingerprint)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
@@ -128,7 +128,7 @@ func (r *SSHKeyResource) Read(ctx context.Context, req resource.ReadRequest, res
 		return
 	}
 
-	state.ID = types.StringValue(sshKey.ID)
+	state.ID = types.StringValue(sshKey.ID.String())
 	state.Title = types.StringValue(sshKey.Title)
 	state.Fingerprint = types.StringValue(sshKey.Fingerprint)
 	if sshKey.Public != "" {

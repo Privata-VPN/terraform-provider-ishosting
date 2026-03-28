@@ -1,0 +1,14 @@
+---
+page_title: "{{.Name}} {{.Type}} - {{.ProviderName}}"
+subcategory: ""
+description: |-
+  Manages an ISHosting VPS instance.
+---
+
+# {{.Name}} ({{.Type}})
+
+Manages an ISHosting VPS instance.
+
+~> **Important:** ISHosting does not support deleting VPS instances via the API. When you run `terraform destroy`, the provider will **disable auto-renew** on the instance instead. The VPS will remain active until the end of the current billing period and will not be renewed after that.
+
+{{ .SchemaMarkdown | trimspace }}

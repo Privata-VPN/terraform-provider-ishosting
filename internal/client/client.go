@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	tls "github.com/refraction-networking/utls"
@@ -23,6 +25,7 @@ type Client struct {
 	BaseURL    string
 	APIToken   string
 	HTTPClient *http.Client
+	orderMu    sync.Mutex // serializes orders since the API uses a shared cart
 }
 
 // newUTLSTransport creates an HTTP/2 transport using uTLS with a Chrome TLS fingerprint
@@ -77,12 +80,19 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 	}
 
 	var reqBody io.Reader
+	var jsonBody []byte
 	if body != nil {
-		jsonBody, err := json.Marshal(body)
+		var err error
+		jsonBody, err = json.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("marshaling request body: %w", err)
 		}
 		reqBody = bytes.NewBuffer(jsonBody)
+	}
+
+	log.Printf("[DEBUG] ISHosting API Request: %s %s", method, u)
+	if jsonBody != nil {
+		log.Printf("[DEBUG] Request Body: %s", string(jsonBody))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, u, reqBody)
@@ -106,6 +116,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 		return nil, fmt.Errorf("reading response body: %w", err)
 	}
 
+	log.Printf("[DEBUG] ISHosting API Response: %s %s -> %d", method, u, resp.StatusCode)
+	log.Printf("[DEBUG] Response Body: %s", string(respBody))
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
 	}
@@ -115,117 +128,83 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 
 // --- VPS Operations ---
 
-// VPS represents a VPS instance.
+// VPS represents a VPS instance matching the actual API response.
 type VPS struct {
-	ID       string   `json:"id"`
-	Name     string   `json:"name"`
-	Tags     []string `json:"tags"`
+	ID       json.Number `json:"id"`
+	Name     string      `json:"name"`
+	Tags     []string    `json:"tags"`
 	Location struct {
-		Name    string `json:"name"`
-		Code    string `json:"code"`
-		Variant struct {
-			Name string `json:"name"`
-			Code string `json:"code"`
-		} `json:"variant"`
+		Name string `json:"name"`
+		Code string `json:"code"`
 	} `json:"location"`
 	Plan struct {
-		Name            string  `json:"name"`
-		Code            string  `json:"code"`
-		Price           float64 `json:"price"`
-		Period          string  `json:"period"`
-		NextCharge      string  `json:"next_charge"`
-		ChargeDeferment string  `json:"charge_deferment"`
-		AutoRenew       bool    `json:"auto_renew"`
+		Name      string `json:"name"`
+		Code      string `json:"code"`
+		Price     string `json:"price"`
+		AutoRenew bool   `json:"auto_renew"`
+		Period    struct {
+			Name string `json:"name"`
+			Code string `json:"code"`
+		} `json:"period"`
 	} `json:"plan"`
 	Platform struct {
 		Name   string `json:"name"`
 		Code   string `json:"code"`
 		Config struct {
 			CPU struct {
-				Cores int    `json:"cores"`
+				Value string `json:"value"`
 				Name  string `json:"name"`
+				Code  string `json:"code"`
 			} `json:"cpu"`
 			RAM struct {
-				Size int    `json:"size"`
-				Unit string `json:"unit"`
-				Name string `json:"name"`
+				Value string `json:"value"`
+				Name  string `json:"name"`
+				Code  string `json:"code"`
 			} `json:"ram"`
 			Drive struct {
-				Size int    `json:"size"`
-				Unit string `json:"unit"`
-				Name string `json:"name"`
-				Type string `json:"type"`
+				Value string `json:"value"`
+				Name  string `json:"name"`
+				Code  string `json:"code"`
 			} `json:"drive"`
 			OS struct {
-				Name    string `json:"name"`
-				Version string `json:"version"`
-				Arch    string `json:"arch"`
+				Value string `json:"value"`
+				Name  string `json:"name"`
+				Code  string `json:"code"`
 			} `json:"os"`
 		} `json:"config"`
 	} `json:"platform"`
 	Network struct {
 		PublicIP   string `json:"public_ip"`
-		Protocols  struct {
+		Protocols struct {
 			IPv4 []IPAddress `json:"ipv4"`
 			IPv6 []IPAddress `json:"ipv6"`
 		} `json:"protocols"`
-		Port      int `json:"port"`
-		Bandwidth struct {
-			Size int    `json:"size"`
-			Unit string `json:"unit"`
-		} `json:"bandwidth"`
+		Port      string `json:"port"`
+		Bandwidth string `json:"bandwidth"`
 	} `json:"network"`
 	Access struct {
-		VNC struct {
-			Host      string `json:"host"`
-			Password  string `json:"password"`
-			IsEnabled bool   `json:"is_enabled"`
-		} `json:"vnc"`
-		SSH struct {
+		SSH *struct {
+			Port  int       `json:"port"`
 			Users []SSHUser `json:"users"`
-			Keys  []string  `json:"keys"`
+			Keys  []struct {
+				ID string `json:"id"`
+			} `json:"keys"`
 		} `json:"ssh"`
 	} `json:"access"`
-	Security struct {
-		Backup struct {
-			Name string `json:"name"`
-			Code string `json:"code"`
-		} `json:"backup"`
-		DDoS struct {
-			Name string `json:"name"`
-			Code string `json:"code"`
-		} `json:"ddos"`
-	} `json:"security"`
-	Tools struct {
-		Panel struct {
-			Name string `json:"name"`
-			Code string `json:"code"`
-		} `json:"panel"`
-		Admin struct {
-			Name string `json:"name"`
-			Code string `json:"code"`
-		} `json:"admin"`
-		Virtualization struct {
-			Name string `json:"name"`
-			Code string `json:"code"`
-		} `json:"virtualization"`
-	} `json:"tools"`
 	Status struct {
-		Name    string `json:"name"`
-		Code    string `json:"code"`
-		Message string `json:"message"`
-		State   struct {
-			Name    string `json:"name"`
-			Code    string `json:"code"`
-			Message string `json:"message"`
+		Name  string `json:"name"`
+		Code  string `json:"code"`
+		State struct {
+			Name string `json:"name"`
+			Code string `json:"code"`
 		} `json:"state"`
 	} `json:"status"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	CreatedAt json.Number `json:"created_at"`
+	UpdatedAt json.Number `json:"updated_at"`
 }
 
 type IPAddress struct {
-	IP      string `json:"ip"`
+	Address string `json:"address"`
 	Mask    string `json:"mask"`
 	Gateway string `json:"gateway"`
 	RDNS    string `json:"rdns"`
@@ -238,16 +217,6 @@ type SSHUser struct {
 	IsEnabled bool   `json:"is_enabled"`
 }
 
-// VPSListResponse wraps the list response.
-type VPSListResponse struct {
-	Data []VPS `json:"data"`
-}
-
-// VPSResponse wraps a single VPS response.
-type VPSResponse struct {
-	Data VPS `json:"data"`
-}
-
 // GetVPS retrieves a VPS by ID.
 func (c *Client) GetVPS(ctx context.Context, id string) (*VPS, error) {
 	respBody, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/vps/%s", id), nil, nil)
@@ -255,12 +224,12 @@ func (c *Client) GetVPS(ctx context.Context, id string) (*VPS, error) {
 		return nil, err
 	}
 
-	var resp VPSResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
+	var vps VPS
+	if err := json.Unmarshal(respBody, &vps); err != nil {
 		return nil, fmt.Errorf("unmarshaling VPS response: %w", err)
 	}
 
-	return &resp.Data, nil
+	return &vps, nil
 }
 
 // VPSPatchRequest represents the PATCH request body for updating a VPS.
@@ -279,18 +248,12 @@ func (c *Client) UpdateVPS(ctx context.Context, id string, req VPSPatchRequest) 
 		return nil, err
 	}
 
-	var resp VPSResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
+	var vps VPS
+	if err := json.Unmarshal(respBody, &vps); err != nil {
 		return nil, fmt.Errorf("unmarshaling VPS update response: %w", err)
 	}
 
-	return &resp.Data, nil
-}
-
-// VPSAction performs a status action on a VPS (start, stop, reboot, cancel).
-func (c *Client) VPSAction(ctx context.Context, id, action string) error {
-	_, err := c.doRequest(ctx, http.MethodPatch, fmt.Sprintf("/vps/%s/status/%s", id, action), nil, nil)
-	return err
+	return &vps, nil
 }
 
 // --- Order Operations ---
@@ -339,18 +302,35 @@ type OrderRequest struct {
 }
 
 type InvoiceResponse struct {
-	Data struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
-		Items  []struct {
-			Identity string `json:"identity"`
-			Type     string `json:"type"`
-			Plan     string `json:"plan"`
-		} `json:"items"`
-	} `json:"data"`
+	ID       json.Number `json:"id"`
+	Cipher   string      `json:"cipher"`
+	Status   struct {
+		Name    string `json:"name"`
+		Code    string `json:"code"`
+	} `json:"status"`
+	Services []struct {
+		Action  string `json:"action"`
+		Type    string `json:"type"`
+		Service struct {
+			ID json.Number `json:"id"`
+		} `json:"service"`
+	} `json:"services"`
+}
+
+// LockOrder acquires the order mutex. Since the ISHosting API uses a shared cart,
+// only one order can be in-flight at a time. Call UnlockOrder when the order is
+// fully processed (i.e. the VPS is active or the order has failed).
+func (c *Client) LockOrder() {
+	c.orderMu.Lock()
+}
+
+// UnlockOrder releases the order mutex.
+func (c *Client) UnlockOrder() {
+	c.orderMu.Unlock()
 }
 
 // CreateOrder creates a new order (provisions a VPS).
+// Caller must hold the order lock (via LockOrder/UnlockOrder).
 func (c *Client) CreateOrder(ctx context.Context, req OrderRequest) (*InvoiceResponse, error) {
 	respBody, err := c.doRequest(ctx, http.MethodPost, "/billing/order", req, nil)
 	if err != nil {
@@ -365,12 +345,29 @@ func (c *Client) CreateOrder(ctx context.Context, req OrderRequest) (*InvoiceRes
 	return &resp, nil
 }
 
+// PayInvoiceRequest represents the request body for paying an invoice.
+type PayInvoiceRequest struct {
+	Balance bool `json:"balance"`
+	Renew   bool `json:"renew"`
+}
+
+// PayInvoice pays an invoice by its ID.
+func (c *Client) PayInvoice(ctx context.Context, invoiceID string, req PayInvoiceRequest) ([]byte, error) {
+	return c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/billing/invoice/%s/pay", invoiceID), req, nil)
+}
+
+// CancelInvoice cancels an unpaid invoice by its ID.
+func (c *Client) CancelInvoice(ctx context.Context, invoiceID string) error {
+	_, err := c.doRequest(ctx, http.MethodPatch, fmt.Sprintf("/billing/invoice/%s/cancel", invoiceID), nil, nil)
+	return err
+}
+
 // WaitForVPSActive polls until the VPS reaches an active state or times out.
 func (c *Client) WaitForVPSActive(ctx context.Context, id string, timeout time.Duration) (*VPS, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		vps, err := c.GetVPS(ctx, id)
-		if err == nil && vps.Status.State.Code == "ACTIVE" {
+		if err == nil && (vps.Status.Code == "running" || vps.Status.State.Code == "Active") {
 			return vps, nil
 		}
 
@@ -385,19 +382,13 @@ func (c *Client) WaitForVPSActive(ctx context.Context, id string, timeout time.D
 
 // --- SSH Key Operations ---
 
+// SSHKey represents an SSH key. The API returns ID as a string in list responses
+// and as an int in create responses, so we use json.Number to handle both.
 type SSHKey struct {
-	ID          string `json:"id"`
-	Fingerprint string `json:"fingerprint"`
-	Title       string `json:"title"`
-	Public      string `json:"public"`
-}
-
-type SSHKeyResponse struct {
-	Data SSHKey `json:"data"`
-}
-
-type SSHKeysListResponse struct {
-	Data []SSHKey `json:"data"`
+	ID          json.Number `json:"id"`
+	Fingerprint string      `json:"fingerprint"`
+	Title       string      `json:"title"`
+	Public      string      `json:"public"`
 }
 
 type SSHKeyCreateRequest struct {
@@ -412,12 +403,12 @@ func (c *Client) ListSSHKeys(ctx context.Context) ([]SSHKey, error) {
 		return nil, err
 	}
 
-	var resp SSHKeysListResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
+	var keys []SSHKey
+	if err := json.Unmarshal(respBody, &keys); err != nil {
 		return nil, fmt.Errorf("unmarshaling SSH keys response: %w", err)
 	}
 
-	return resp.Data, nil
+	return keys, nil
 }
 
 // CreateSSHKey creates a new SSH key.
@@ -427,12 +418,12 @@ func (c *Client) CreateSSHKey(ctx context.Context, req SSHKeyCreateRequest) (*SS
 		return nil, err
 	}
 
-	var resp SSHKeyResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
+	var key SSHKey
+	if err := json.Unmarshal(respBody, &key); err != nil {
 		return nil, fmt.Errorf("unmarshaling SSH key response: %w", err)
 	}
 
-	return &resp.Data, nil
+	return &key, nil
 }
 
 // GetSSHKey retrieves a single SSH key by ID (fetches all and filters).
@@ -442,7 +433,7 @@ func (c *Client) GetSSHKey(ctx context.Context, id string) (*SSHKey, error) {
 		return nil, err
 	}
 	for _, key := range keys {
-		if key.ID == id {
+		if key.ID.String() == id {
 			return &key, nil
 		}
 	}
@@ -507,7 +498,7 @@ func (c *Client) GetVPSIP(ctx context.Context, vpsID, protocol, ip string) (*IPA
 	}
 
 	for _, addr := range ips {
-		if addr.IP == ip {
+		if addr.Address == ip {
 			return &addr, nil
 		}
 	}

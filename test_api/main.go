@@ -54,7 +54,7 @@ func main() {
 		Timeout:   30 * time.Second,
 	}
 
-	req, err := http.NewRequest(http.MethodGet, "https://api.ishosting.com/profile", nil)
+	req, err := http.NewRequest(http.MethodGet, "https://api.ishosting.com/settings/ssh", nil)
 	if err != nil {
 		fmt.Printf("Error creating request: %v\n", err)
 		os.Exit(1)

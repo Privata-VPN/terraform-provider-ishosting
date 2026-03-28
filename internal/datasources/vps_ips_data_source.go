@@ -133,7 +133,7 @@ func (d *VPSIPsDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 	state.IPv4 = make([]IPModel, len(ipv4s))
 	for i, ip := range ipv4s {
 		state.IPv4[i] = IPModel{
-			Address: types.StringValue(ip.IP),
+			Address: types.StringValue(ip.Address),
 			Mask:    types.StringValue(ip.Mask),
 			Gateway: types.StringValue(ip.Gateway),
 			RDNS:    types.StringValue(ip.RDNS),
@@ -144,7 +144,7 @@ func (d *VPSIPsDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 	state.IPv6 = make([]IPModel, len(ipv6s))
 	for i, ip := range ipv6s {
 		state.IPv6[i] = IPModel{
-			Address: types.StringValue(ip.IP),
+			Address: types.StringValue(ip.Address),
 			Mask:    types.StringValue(ip.Mask),
 			Gateway: types.StringValue(ip.Gateway),
 			RDNS:    types.StringValue(ip.RDNS),

@@ -3,7 +3,7 @@ package resources
 import (
 	"context"
 	"fmt"
-	"time"
+	"strings"
 
 	"terraform-provider-ishosting/internal/client"
 
@@ -47,6 +47,9 @@ type VPSResourceModel struct {
 
 	// Additions
 	Additions types.List `tfsdk:"additions"`
+
+	// Internal tracking
+	InvoiceID types.String `tfsdk:"invoice_id"`
 
 	// Computed
 	PublicIP       types.String `tfsdk:"public_ip"`
@@ -186,6 +189,12 @@ func (r *VPSResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 						},
 					},
 				},
+			},
+
+			// Internal tracking
+			"invoice_id": schema.StringAttribute{
+				Description: "Invoice ID from the order. Used to cancel unpaid orders on destroy.",
+				Computed:    true,
 			},
 
 			// Computed attributes
@@ -354,6 +363,11 @@ func (r *VPSResource) Create(ctx context.Context, req resource.CreateRequest, re
 
 	tflog.Debug(ctx, "Creating VPS order")
 
+	// Lock the order mutex to ensure only one order (cart) is processed at a time.
+	// Hold the lock until the VPS is active so a concurrent order can't interfere.
+	r.client.LockOrder()
+	defer r.client.UnlockOrder()
+
 	invoiceResp, err := r.client.CreateOrder(ctx, orderReq)
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -363,44 +377,64 @@ func (r *VPSResource) Create(ctx context.Context, req resource.CreateRequest, re
 		return
 	}
 
-	// Extract VPS ID from the invoice items
+	// Save invoice ID to state immediately so destroy can cancel it if payment fails
+	plan.InvoiceID = types.StringValue(invoiceResp.ID.String())
+
+	// Extract VPS ID from the invoice services
 	var vpsID string
-	if len(invoiceResp.Data.Items) > 0 {
-		vpsID = invoiceResp.Data.Items[0].Identity
+	for _, svc := range invoiceResp.Services {
+		if svc.Type == "vps" {
+			vpsID = svc.Service.ID.String()
+			break
+		}
 	}
 
 	if vpsID == "" {
+		// Save state with invoice ID so destroy can cancel the invoice
+		resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 		resp.Diagnostics.AddError(
 			"Error Creating VPS",
-			"No VPS identity returned from order response.",
+			"No VPS service ID returned from order response.",
 		)
 		return
 	}
 
-	tflog.Debug(ctx, fmt.Sprintf("VPS ordered, ID: %s. Waiting for activation...", vpsID))
-
-	// Wait for VPS to become active
-	vps, err := r.client.WaitForVPSActive(ctx, vpsID, 15*time.Minute)
-	if err != nil {
-		// Even if we timeout, save the ID so the resource can be managed
-		plan.ID = types.StringValue(vpsID)
-		resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
-		resp.Diagnostics.AddWarning(
-			"VPS Not Yet Active",
-			fmt.Sprintf("VPS %s was ordered but is not yet active: %s. Run 'terraform refresh' later.", vpsID, err.Error()),
-		)
-		return
-	}
-
-	// Update model with VPS data
-	r.mapVPSToModel(vps, &plan)
+	// Save state with VPS ID + invoice ID before payment, so destroy can clean up
+	plan.ID = types.StringValue(vpsID)
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+
+	// Pay the invoice
+	tflog.Debug(ctx, fmt.Sprintf("Paying invoice %s", invoiceResp.ID.String()))
+
+	payResp, err := r.client.PayInvoice(ctx, invoiceResp.ID.String(), client.PayInvoiceRequest{
+		Balance: true,
+		Renew:   true,
+	})
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Paying Invoice",
+			fmt.Sprintf("Could not pay invoice %s: %s. Run 'terraform destroy' to cancel the unpaid order.", invoiceResp.ID.String(), err.Error()),
+		)
+		return
+	}
+
+	tflog.Debug(ctx, fmt.Sprintf("Invoice payment response: %s", string(payResp)))
+	tflog.Debug(ctx, fmt.Sprintf("VPS ordered and paid, ID: %s. VPS will be provisioned shortly.", vpsID))
+
+	// State is already saved with VPS ID + invoice ID from above.
+	// The VPS will be provisioned asynchronously — run 'terraform refresh' to update computed fields.
 }
 
 func (r *VPSResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state VPSResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// If the VPS ID is empty, the order was created but never paid/provisioned.
+	// Keep the state as-is so destroy can cancel the invoice.
+	if state.ID.IsNull() || state.ID.ValueString() == "" {
 		return
 	}
 
@@ -434,15 +468,18 @@ func (r *VPSResource) Update(ctx context.Context, req resource.UpdateRequest, re
 		patchReq.Name = &name
 	}
 
-	// Update tags if changed
-	if !plan.Tags.Equal(state.Tags) {
-		var tags []string
+	// Tags are always required by the API in PATCH requests
+	var tags []string
+	if !plan.Tags.IsNull() {
 		resp.Diagnostics.Append(plan.Tags.ElementsAs(ctx, &tags, false)...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
-		patchReq.Tags = tags
 	}
+	if tags == nil {
+		tags = []string{}
+	}
+	patchReq.Tags = tags
 
 	// Update auto_renew if changed
 	if !plan.AutoRenew.Equal(state.AutoRenew) {
@@ -484,40 +521,88 @@ func (r *VPSResource) Delete(ctx context.Context, req resource.DeleteRequest, re
 		return
 	}
 
-	err := r.client.VPSAction(ctx, state.ID.ValueString(), "cancel")
+	// If the VPS was never paid for (no state/status), cancel the invoice instead
+	if state.State.IsNull() || state.State.ValueString() == "" {
+		if !state.InvoiceID.IsNull() && state.InvoiceID.ValueString() != "" {
+			tflog.Debug(ctx, fmt.Sprintf("VPS not provisioned, cancelling invoice %s", state.InvoiceID.ValueString()))
+			err := r.client.CancelInvoice(ctx, state.InvoiceID.ValueString())
+			if err != nil {
+				resp.Diagnostics.AddError(
+					"Error Cancelling Invoice",
+					fmt.Sprintf("Could not cancel invoice %s: %s", state.InvoiceID.ValueString(), err.Error()),
+				)
+				return
+			}
+			tflog.Debug(ctx, fmt.Sprintf("Invoice %s cancelled", state.InvoiceID.ValueString()))
+			return
+		}
+		// No invoice ID and no VPS state — nothing to clean up
+		return
+	}
+
+	// ISHosting does not support deleting VPS instances via the API.
+	// Instead, disable auto-renew so the instance expires at the end of the billing period.
+	autoRenew := false
+	patchReq := client.VPSPatchRequest{
+		Plan: &struct {
+			AutoRenew *bool `json:"auto_renew,omitempty"`
+		}{
+			AutoRenew: &autoRenew,
+		},
+	}
+
+	// Tags are required in PATCH requests
+	var tags []string
+	if !state.Tags.IsNull() {
+		state.Tags.ElementsAs(ctx, &tags, false)
+	}
+	if tags == nil {
+		tags = []string{}
+	}
+	patchReq.Tags = tags
+
+	_, err := r.client.UpdateVPS(ctx, state.ID.ValueString(), patchReq)
 	if err != nil {
 		resp.Diagnostics.AddError(
-			"Error Cancelling VPS",
-			"Could not cancel VPS "+state.ID.ValueString()+": "+err.Error(),
+			"Error Disabling Auto-Renew",
+			"Could not disable auto-renew for VPS "+state.ID.ValueString()+": "+err.Error(),
 		)
 		return
 	}
 
-	tflog.Debug(ctx, fmt.Sprintf("VPS %s cancelled", state.ID.ValueString()))
+	resp.Diagnostics.AddWarning(
+		"VPS Not Deleted",
+		fmt.Sprintf("ISHosting does not support deleting VPS instances. Auto-renew has been disabled for VPS %s. "+
+			"The instance will be decommissioned at the end of the current billing period.", state.ID.ValueString()),
+	)
+
+	tflog.Warn(ctx, fmt.Sprintf("VPS %s: auto-renew disabled, instance will expire at end of billing period", state.ID.ValueString()))
 }
 
 func (r *VPSResource) mapVPSToModel(vps *client.VPS, model *VPSResourceModel) {
-	model.ID = types.StringValue(vps.ID)
+	model.ID = types.StringValue(vps.ID.String())
 	model.Name = types.StringValue(vps.Name)
 	model.PublicIP = types.StringValue(vps.Network.PublicIP)
 	model.Status = types.StringValue(vps.Status.Code)
 	model.State = types.StringValue(vps.Status.State.Code)
 	model.PlatformName = types.StringValue(vps.Platform.Name)
-	model.CPUCores = types.Int64Value(int64(vps.Platform.Config.CPU.Cores))
-	model.RAMSize = types.Int64Value(int64(vps.Platform.Config.RAM.Size))
-	model.RAMUnit = types.StringValue(vps.Platform.Config.RAM.Unit)
-	model.DriveSize = types.Int64Value(int64(vps.Platform.Config.Drive.Size))
-	model.DriveUnit = types.StringValue(vps.Platform.Config.Drive.Unit)
-	model.DriveType = types.StringValue(vps.Platform.Config.Drive.Type)
 	model.OSName = types.StringValue(vps.Platform.Config.OS.Name)
-	model.OSVersion = types.StringValue(vps.Platform.Config.OS.Version)
 	model.LocationName = types.StringValue(vps.Location.Name)
-	model.Location = types.StringValue(vps.Location.Variant.Code)
+	model.Location = types.StringValue(strings.ToLower(vps.Location.Code))
 	model.PlanName = types.StringValue(vps.Plan.Name)
 	model.Plan = types.StringValue(vps.Plan.Code)
-	model.PlanPrice = types.Float64Value(vps.Plan.Price)
 	model.AutoRenew = types.BoolValue(vps.Plan.AutoRenew)
-	model.CreatedAt = types.StringValue(vps.CreatedAt)
+	model.CreatedAt = types.StringValue(vps.CreatedAt.String())
+
+	// Config fields use value/name/code strings in the API, map the names
+	model.CPUCores = types.Int64Value(0)
+	model.RAMSize = types.Int64Value(0)
+	model.RAMUnit = types.StringValue(vps.Platform.Config.RAM.Name)
+	model.DriveSize = types.Int64Value(0)
+	model.DriveUnit = types.StringValue(vps.Platform.Config.Drive.Name)
+	model.DriveType = types.StringValue(vps.Platform.Config.Drive.Code)
+	model.OSVersion = types.StringValue(vps.Platform.Config.OS.Code)
+	model.PlanPrice = types.Float64Value(0)
 
 	// Map tags
 	if len(vps.Tags) > 0 {
