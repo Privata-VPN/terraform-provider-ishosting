@@ -1,23 +1,15 @@
-name: Publish to Terraform Cloud Private Registry
+name: Publish to Terraform Public Registry
 
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (without v prefix, e.g. 0.2.0)"
-        required: true
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   PROVIDER_NAME: ishosting
-  ORG_NAME: privata-solutions
-  GPG_KEY_ID: F4F666D872BE7E81
-  TF_CLOUD_API: https://app.terraform.io
   GO_VERSION: "1.24"
 
 jobs:
@@ -34,12 +26,7 @@ jobs:
 
       - name: Determine version
         id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "value=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          fi
+        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build binaries
         run: |
@@ -61,6 +48,18 @@ jobs:
             rm "$bin"
             echo "::endgroup::"
           done
+
+      - name: Create manifest
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          cat > "terraform-provider-${PROVIDER_NAME}_${version}_manifest.json" <<'EOF'
+          {
+            "version": 1,
+            "metadata": {
+              "protocol_versions": ["5.0"]
+            }
+          }
+          EOF
 
       - name: Generate SHA256SUMS
         id: shasums
@@ -86,147 +85,19 @@ jobs:
               --detach-sign "${{ steps.shasums.outputs.file }}"
           fi
 
-          echo "Signature created: ${{ steps.shasums.outputs.file }}.sig"
-
-      # ── One-time setup (idempotent) ──────────────────────────────
-
-      - name: Ensure provider exists in registry
+      - name: Create GitHub Release and upload assets
         env:
-          TF_TOKEN: ${{ secrets.TF_API_TOKEN }}
-        run: |
-          http_code=$(curl -s -o /tmp/provider_resp.json -w "%{http_code}" \
-            --header "Authorization: Bearer $TF_TOKEN" \
-            --header "Content-Type: application/vnd.api+json" \
-            --request POST \
-            --data @provider.json \
-            "${TF_CLOUD_API}/api/v2/organizations/${ORG_NAME}/registry-providers")
-
-          if [ "$http_code" = "201" ]; then
-            echo "Provider created successfully"
-          elif [ "$http_code" = "422" ]; then
-            echo "Provider already exists — OK"
-          else
-            echo "::error::Failed to ensure provider exists (HTTP $http_code)"
-            cat /tmp/provider_resp.json
-            exit 1
-          fi
-
-      # ── Create version ───────────────────────────────────────────
-
-      - name: Create provider version
-        id: create_version
-        env:
-          TF_TOKEN: ${{ secrets.TF_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="${{ steps.version.outputs.value }}"
+          tag="${GITHUB_REF_NAME}"
 
-          version_payload=$(jq -n \
-            --arg ver "$version" \
-            --arg key "$GPG_KEY_ID" \
-            '{
-              data: {
-                type: "registry-provider-versions",
-                attributes: {
-                  version: $ver,
-                  "key-id": $key,
-                  protocols: ["5.0"]
-                }
-              }
-            }')
+          gh release create "$tag" \
+            --title "v${version}" \
+            --generate-notes \
+            terraform-provider-${PROVIDER_NAME}_${version}_*.zip \
+            terraform-provider-${PROVIDER_NAME}_${version}_manifest.json \
+            terraform-provider-${PROVIDER_NAME}_${version}_SHA256SUMS \
+            terraform-provider-${PROVIDER_NAME}_${version}_SHA256SUMS.sig
 
-          response=$(curl -s -w "\n%{http_code}" \
-            --header "Authorization: Bearer $TF_TOKEN" \
-            --header "Content-Type: application/vnd.api+json" \
-            --request POST \
-            --data "$version_payload" \
-            "${TF_CLOUD_API}/api/v2/organizations/${ORG_NAME}/registry-providers/private/${ORG_NAME}/${PROVIDER_NAME}/versions")
-
-          http_code=$(echo "$response" | tail -1)
-          body=$(echo "$response" | sed '$d')
-
-          if [ "$http_code" != "201" ]; then
-            echo "::error::Failed to create version (HTTP $http_code)"
-            echo "$body"
-            exit 1
-          fi
-
-          shasums_upload=$(echo "$body" | jq -r '.data.links."shasums-upload"')
-          shasums_sig_upload=$(echo "$body" | jq -r '.data.links."shasums-sig-upload"')
-
-          echo "shasums_upload=$shasums_upload" >> "$GITHUB_OUTPUT"
-          echo "shasums_sig_upload=$shasums_sig_upload" >> "$GITHUB_OUTPUT"
-          echo "Version $version created"
-
-      # ── Upload SHA256SUMS + signature ────────────────────────────
-
-      - name: Upload SHA256SUMS
-        run: |
-          curl --fail -T "${{ steps.shasums.outputs.file }}" \
-            "${{ steps.create_version.outputs.shasums_upload }}"
-          echo "SHA256SUMS uploaded"
-
-      - name: Upload SHA256SUMS.sig
-        run: |
-          curl --fail -T "${{ steps.shasums.outputs.file }}.sig" \
-            "${{ steps.create_version.outputs.shasums_sig_upload }}"
-          echo "SHA256SUMS.sig uploaded"
-
-      # ── Create platforms and upload binaries ─────────────────────
-
-      - name: Create platforms and upload binaries
-        env:
-          TF_TOKEN: ${{ secrets.TF_API_TOKEN }}
-        run: |
-          version="${{ steps.version.outputs.value }}"
-          declare -a platforms=("linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64" "windows/amd64")
-
-          for platform in "${platforms[@]}"; do
-            os="${platform%/*}"
-            arch="${platform#*/}"
-            filename="terraform-provider-${PROVIDER_NAME}_${version}_${os}_${arch}.zip"
-            shasum=$(sha256sum "$filename" | awk '{print $1}')
-
-            echo "::group::Platform ${os}/${arch}"
-
-            platform_payload=$(jq -n \
-              --arg os "$os" \
-              --arg arch "$arch" \
-              --arg shasum "$shasum" \
-              --arg filename "$filename" \
-              '{
-                data: {
-                  type: "registry-provider-version-platforms",
-                  attributes: {
-                    os: $os,
-                    arch: $arch,
-                    shasum: $shasum,
-                    filename: $filename
-                  }
-                }
-              }')
-
-            response=$(curl -s -w "\n%{http_code}" \
-              --header "Authorization: Bearer $TF_TOKEN" \
-              --header "Content-Type: application/vnd.api+json" \
-              --request POST \
-              --data "$platform_payload" \
-              "${TF_CLOUD_API}/api/v2/organizations/${ORG_NAME}/registry-providers/private/${ORG_NAME}/${PROVIDER_NAME}/versions/${version}/platforms")
-
-            http_code=$(echo "$response" | tail -1)
-            body=$(echo "$response" | sed '$d')
-
-            if [ "$http_code" != "201" ]; then
-              echo "::error::Failed to create platform ${os}/${arch} (HTTP $http_code)"
-              echo "$body"
-              exit 1
-            fi
-
-            upload_url=$(echo "$body" | jq -r '.data.links."provider-binary-upload"')
-
-            curl --fail -T "$filename" "$upload_url"
-
-            echo "Uploaded $filename"
-            echo "::endgroup::"
-          done
-
-          echo "All platforms published successfully"
+          echo "Release v${version} published with all assets"
