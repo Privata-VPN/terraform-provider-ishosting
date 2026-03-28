@@ -3,12 +3,17 @@ package client
 import (
 	"bytes"
 	"context"
+	crypt "crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"time"
+
+	tls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 const defaultBaseURL = "https://api.ishosting.com"
@@ -20,6 +25,36 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
+// newUTLSTransport creates an HTTP/2 transport using uTLS with a Chrome TLS fingerprint
+// to avoid Cloudflare bot detection that blocks Go's default TLS stack.
+func newUTLSTransport() http.RoundTripper {
+	dialTLS := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialer := &net.Dialer{Timeout: 30 * time.Second}
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+
+		tlsConn := tls.UClient(conn, &tls.Config{ServerName: host}, tls.HelloChrome_Auto)
+		if err := tlsConn.Handshake(); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+
+	return &http2.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *crypt.Config) (net.Conn, error) {
+			return dialTLS(ctx, network, addr)
+		},
+	}
+}
+
 // NewClient creates a new ISHosting API client.
 func NewClient(apiToken, baseURL string) *Client {
 	if baseURL == "" {
@@ -29,7 +64,8 @@ func NewClient(apiToken, baseURL string) *Client {
 		BaseURL:  baseURL,
 		APIToken: apiToken,
 		HTTPClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Transport: newUTLSTransport(),
+			Timeout:   120 * time.Second,
 		},
 	}
 }
@@ -57,6 +93,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 	req.Header.Set("X-Api-Token", c.APIToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
