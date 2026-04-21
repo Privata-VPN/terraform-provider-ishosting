@@ -419,10 +419,21 @@ func (r *VPSResource) Create(ctx context.Context, req resource.CreateRequest, re
 	}
 
 	tflog.Debug(ctx, fmt.Sprintf("Invoice payment response: %s", string(payResp)))
-	tflog.Debug(ctx, fmt.Sprintf("VPS ordered and paid, ID: %s. VPS will be provisioned shortly.", vpsID))
+	tflog.Debug(ctx, fmt.Sprintf("VPS ordered and paid, ID: %s.", vpsID))
 
-	// State is already saved with VPS ID + invoice ID from above.
-	// The VPS will be provisioned asynchronously — run 'terraform refresh' to update computed fields.
+	// Read VPS so every computed attr is a known value — terraform-plugin-framework
+	// refuses the apply otherwise. The VPS is still "installing" at this point;
+	// fields like public_ip come back populated, others may be empty strings.
+	vps, err := r.client.GetVPS(ctx, vpsID)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Reading VPS After Create",
+			fmt.Sprintf("VPS %s was paid but could not be read back: %s", vpsID, err.Error()),
+		)
+		return
+	}
+	r.mapVPSToModel(vps, &plan)
+	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
 func (r *VPSResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
