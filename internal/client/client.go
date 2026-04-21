@@ -574,12 +574,13 @@ func (c *Client) ListVPSPlans(ctx context.Context, locations, platforms []string
 		return nil, err
 	}
 
-	var resp VPSPlansResponse
+	// API returns a bare JSON array, not {"data": [...]}. Unmarshal directly.
+	var resp []VPSPlan
 	if err := json.Unmarshal(respBody, &resp); err != nil {
 		return nil, fmt.Errorf("unmarshaling VPS plans response: %w", err)
 	}
 
-	return resp.Data, nil
+	return resp, nil
 }
 
 // VPSConfigsResponse represents available configuration options for a plan.

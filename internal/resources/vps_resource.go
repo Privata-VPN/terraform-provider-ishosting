@@ -3,6 +3,7 @@ package resources
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"terraform-provider-ishosting/internal/client"
@@ -419,10 +420,21 @@ func (r *VPSResource) Create(ctx context.Context, req resource.CreateRequest, re
 	}
 
 	tflog.Debug(ctx, fmt.Sprintf("Invoice payment response: %s", string(payResp)))
-	tflog.Debug(ctx, fmt.Sprintf("VPS ordered and paid, ID: %s. VPS will be provisioned shortly.", vpsID))
+	tflog.Debug(ctx, fmt.Sprintf("VPS ordered and paid, ID: %s.", vpsID))
 
-	// State is already saved with VPS ID + invoice ID from above.
-	// The VPS will be provisioned asynchronously — run 'terraform refresh' to update computed fields.
+	// Read VPS so every computed attr is a known value — terraform-plugin-framework
+	// refuses the apply otherwise. The VPS is still "installing" at this point;
+	// fields like public_ip come back populated, others may be empty strings.
+	vps, err := r.client.GetVPS(ctx, vpsID)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Reading VPS After Create",
+			fmt.Sprintf("VPS %s was paid but could not be read back: %s", vpsID, err.Error()),
+		)
+		return
+	}
+	r.mapVPSToModel(vps, &plan)
+	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
 func (r *VPSResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -594,19 +606,45 @@ func (r *VPSResource) mapVPSToModel(vps *client.VPS, model *VPSResourceModel) {
 	model.AutoRenew = types.BoolValue(vps.Plan.AutoRenew)
 	model.CreatedAt = types.StringValue(vps.CreatedAt.String())
 
-	// Config fields use value/name/code strings in the API, map the names
-	model.CPUCores = types.Int64Value(0)
-	model.RAMSize = types.Int64Value(0)
+	// Config fields arrive as opaque strings; pluck the leading number.
+	//   cpu.value  = "2x2900"   → cores=2
+	//   ram.value  = "2g"       → size=2
+	//   drive.value= "30/nvme"  → size=30
+	//   plan.price = "11.99$"   → 11.99
+	model.CPUCores = types.Int64Value(leadingInt(vps.Platform.Config.CPU.Value))
+	model.RAMSize = types.Int64Value(leadingInt(vps.Platform.Config.RAM.Value))
 	model.RAMUnit = types.StringValue(vps.Platform.Config.RAM.Name)
-	model.DriveSize = types.Int64Value(0)
+	model.DriveSize = types.Int64Value(leadingInt(vps.Platform.Config.Drive.Value))
 	model.DriveUnit = types.StringValue(vps.Platform.Config.Drive.Name)
 	model.DriveType = types.StringValue(vps.Platform.Config.Drive.Code)
 	model.OSVersion = types.StringValue(vps.Platform.Config.OS.Code)
-	model.PlanPrice = types.Float64Value(0)
+	model.PlanPrice = types.Float64Value(parsePrice(vps.Plan.Price))
 
 	// Map tags
 	if len(vps.Tags) > 0 {
 		tags, _ := types.ListValueFrom(context.Background(), types.StringType, vps.Tags)
 		model.Tags = tags
 	}
+}
+
+// leadingInt returns the integer prefix of s, or 0 if s doesn't start with digits.
+func leadingInt(s string) int64 {
+	end := 0
+	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	n, _ := strconv.ParseInt(s[:end], 10, 64)
+	return n
+}
+
+// parsePrice strips a trailing "$" and parses the remaining number; returns 0 on failure.
+func parsePrice(s string) float64 {
+	n, err := strconv.ParseFloat(strings.TrimSuffix(s, "$"), 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
